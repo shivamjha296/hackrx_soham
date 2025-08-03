@@ -113,7 +113,7 @@ def download_and_parse_pdf(pdf_url: str) -> List[str]:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to parse the PDF document.")
 
 
-def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embeddings: np.ndarray, model: FlagModel, top_k: int = 5) -> str:
+def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embeddings: np.ndarray, model: SentenceTransformer, top_k: int = 5) -> str:
     """
     Retrieves the most relevant context chunks for a given query using semantic search.
     
@@ -127,8 +127,8 @@ def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embed
     Returns:
         A single string containing the concatenated relevant context.
     """
-    # Encode the query to get its embedding
-    query_embedding = model.encode_queries([query])
+    # Encode the query to get its embedding (simplified for SentenceTransformer)
+    query_embedding = model.encode([query])
     
     # Perform semantic search using sentence-transformers utility which is compatible with FAISS-like operations
     # This finds the 'top_k' most similar chunks from the corpus

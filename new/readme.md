@@ -7,7 +7,7 @@ This project is an intelligent query-retrieval system designed to process large 
 ## ✨ Features
 
 - **Multi-Format Document Processing:** Handles PDF documents fetched directly from a URL.
-- **Semantic Search:** Uses advanced `BAAI/bge-base-en-v1.5` embeddings and a FAISS vector index for fast and accurate clause retrieval.
+- **Semantic Search:** Uses optimized `sentence-transformers/all-MiniLM-L6-v2` embeddings (~90MB) for fast and accurate clause retrieval with significantly reduced latency.
 - **LLM-Powered Decision Making:** Integrates with the **Mistral** LLM to generate precise answers based on retrieved document context.
 - **Explainable AI:** Answers are grounded in the provided text, ensuring traceability and minimizing hallucinations.
 - **Structured Output:** Delivers responses in a clean, predictable JSON format.
@@ -19,7 +19,7 @@ This project is an intelligent query-retrieval system designed to process large 
 
 - **Backend Framework:** FastAPI
 - **Large Language Model (LLM):** Mistral (`mistral-large-latest`)
-- **Embedding Model:** BAAI/bge-base-en-v1.5
+- **Embedding Model:** sentence-transformers/all-MiniLM-L6-v2 (Optimized for speed and low memory usage)
 - **Vector Search:** FAISS (via `sentence-transformers`)
 - **Document Parsing:** PyPDF
 
