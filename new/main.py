@@ -3,6 +3,7 @@
 import os
 import logging
 from typing import List
+from contextlib import asynccontextmanager
 
 import numpy as np
 import requests
@@ -27,19 +28,13 @@ load_dotenv()
 # Authentication Token (as specified in the problem description)
 EXPECTED_AUTH_TOKEN = "Bearer 02b1ad646a69f58d41c75bb9ea5f78bbaf30389258623d713ff4115b554377f0"
 
-# --- Initialize FastAPI App ---
-app = FastAPI(
-    title="LLM-Powered Intelligent Query–Retrieval System",
-    description="Processes documents to answer contextual questions using RAG.",
-    version="1.0.0"
-)
-
 # --- Initialize Models (Global Singleton Pattern) ---
 # This ensures models are loaded only once on startup, improving latency.
 
-@app.on_event("startup")
-async def startup_event():
-    """Load models on application startup."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load models on application startup and cleanup on shutdown."""
+    # Startup
     logging.info("Loading lightweight embedding model...")
     
     # Using the recommended lightweight model for better performance and lower memory usage
@@ -56,6 +51,19 @@ async def startup_event():
         raise ValueError("MISTRAL_API_KEY not found in .env file.")
     app.state.mistral_client = Mistral(api_key=api_key)
     logging.info("Mistral Client initialized successfully.")
+    
+    yield
+    
+    # Shutdown (cleanup if needed)
+    logging.info("Application shutdown complete.")
+
+# --- Initialize FastAPI App ---
+app = FastAPI(
+    title="LLM-Powered Intelligent Query–Retrieval System",
+    description="Processes documents to answer contextual questions using RAG.",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 # --- Pydantic Models for API Data Validation ---
 
@@ -247,4 +255,6 @@ async def run_submission(request: Request, submission: SubmissionRequest):
 
 # --- To run the server ---
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use PORT environment variable from Render, fallback to 8000 for local development
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
