@@ -1,12 +1,11 @@
-fastapi==0.116.1
-uvicorn[standard]==0.35.0
-pydantic==2.11.7
-requests==2.32.4
-pypdf==5.9.0
-sentence-transformers==5.0.0
-numpy==2.3.2
-mistralai==1.9.3
-python-dotenv==1.1.1
-# Removed heavy dependencies that were causing memory issues:
-# - FlagEmbedding (uses heavy BGE models ~440MB)
-# - faiss-cpu (not needed for small datasets, we use semantic_search from sentence-transformers)
+fastapi
+uvicorn[standard]
+pydantic
+requests
+pypdf
+scikit-learn
+numpy
+mistralai
+python-dotenv
+# Using Mistral's embedding API instead of local models for better scalability
+# and to reduce memory usage and deployment complexity

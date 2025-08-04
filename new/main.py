@@ -10,9 +10,8 @@ import requests
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, status
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import semantic_search
 from mistralai import Mistral
+from sklearn.metrics.pairwise import cosine_similarity
 from pydantic import BaseModel, HttpUrl
 from pypdf import PdfReader
 from io import BytesIO
@@ -28,6 +27,10 @@ load_dotenv()
 # Authentication Token (as specified in the problem description)
 EXPECTED_AUTH_TOKEN = "Bearer 02b1ad646a69f58d41c75bb9ea5f78bbaf30389258623d713ff4115b554377f0"
 
+# Mistral API Configuration
+MISTRAL_EMBEDDING_BATCH_SIZE = 20  # Conservative batch size for Mistral API
+MISTRAL_EMBEDDING_MODEL = "mistral-embed"
+
 # --- Initialize Models (Global Singleton Pattern) ---
 # This ensures models are loaded only once on startup, improving latency.
 
@@ -35,15 +38,6 @@ EXPECTED_AUTH_TOKEN = "Bearer 02b1ad646a69f58d41c75bb9ea5f78bbaf30389258623d713f
 async def lifespan(app: FastAPI):
     """Load models on application startup and cleanup on shutdown."""
     # Startup
-    logging.info("Loading lightweight embedding model...")
-    
-    # Using the recommended lightweight model for better performance and lower memory usage
-    # This model is only ~90MB compared to ~440MB of BGE, perfect for resource-constrained environments
-    model_name = 'sentence-transformers/all-MiniLM-L6-v2'
-    
-    app.state.embedding_model = SentenceTransformer(model_name)
-    logging.info(f"'{model_name}' model loaded successfully - optimized for speed and low memory usage.")
-
     logging.info("Initializing Mistral LLM Client...")
     # Initialize the Mistral client with the API key from .env
     api_key = os.getenv("MISTRAL_API_KEY")
@@ -75,6 +69,51 @@ class SubmissionResponse(BaseModel):
     answers: List[str]
 
 # --- Core Service Functions ---
+
+def generate_embeddings(texts: List[str], client: Mistral, batch_size: int = MISTRAL_EMBEDDING_BATCH_SIZE) -> np.ndarray:
+    """
+    Generate embeddings for a list of texts using Mistral's embedding API.
+    Processes texts in batches to avoid API limits.
+    
+    Args:
+        texts: List of text strings to embed.
+        client: The Mistral API client.
+        batch_size: Maximum number of texts to process in one API call.
+        
+    Returns:
+        A numpy array of embeddings.
+    """
+    try:
+        logging.info(f"Generating embeddings for {len(texts)} text chunks using Mistral API...")
+        
+        all_embeddings = []
+        
+        # Process texts in batches
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(texts) + batch_size - 1) // batch_size
+            
+            logging.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} texts)")
+            
+            embeddings_response = client.embeddings.create(
+                model=MISTRAL_EMBEDDING_MODEL,
+                inputs=batch
+            )
+            
+            # Extract embeddings from the response
+            batch_embeddings = [item.embedding for item in embeddings_response.data]
+            all_embeddings.extend(batch_embeddings)
+            
+            logging.info(f"Successfully processed batch {batch_num}/{total_batches}")
+        
+        embeddings_array = np.array(all_embeddings)
+        logging.info(f"Successfully generated all embeddings: shape {embeddings_array.shape}")
+        return embeddings_array
+        
+    except Exception as e:
+        logging.error(f"Error generating embeddings with Mistral API: {e}")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="The embedding service is currently unavailable.")
 
 def download_and_parse_pdf(pdf_url: str) -> List[str]:
     """
@@ -121,7 +160,7 @@ def download_and_parse_pdf(pdf_url: str) -> List[str]:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to parse the PDF document.")
 
 
-def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embeddings: np.ndarray, model: SentenceTransformer, top_k: int = 5) -> str:
+def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embeddings: np.ndarray, client: Mistral, top_k: int = 5) -> str:
     """
     Retrieves the most relevant context chunks for a given query using semantic search.
     
@@ -129,24 +168,26 @@ def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embed
         query: The user's question.
         corpus_chunks: The list of text chunks from the document.
         corpus_embeddings: The pre-computed embeddings for the corpus chunks.
-        model: The embedding model instance.
+        client: The Mistral API client.
         top_k: The number of top relevant chunks to retrieve.
 
     Returns:
         A single string containing the concatenated relevant context.
     """
-    # Encode the query to get its embedding (simplified for SentenceTransformer)
-    query_embedding = model.encode([query])
+    # Generate embedding for the query using Mistral
+    query_embedding = generate_embeddings([query], client)
     
-    # Perform semantic search using sentence-transformers utility which is compatible with FAISS-like operations
-    # This finds the 'top_k' most similar chunks from the corpus
-    hits = semantic_search(query_embedding, corpus_embeddings, top_k=top_k)[0]
+    # Calculate cosine similarity between query and all corpus chunks
+    similarities = cosine_similarity(query_embedding, corpus_embeddings)[0]
+    
+    # Get top_k most similar chunks
+    top_indices = np.argsort(similarities)[-top_k:][::-1]  # Sort in descending order
     
     # Collate the context from the retrieved chunks
-    context_chunks = [corpus_chunks[hit['corpus_id']] for hit in hits]
+    context_chunks = [corpus_chunks[idx] for idx in top_indices]
     relevant_context = "\n---\n".join(context_chunks)
     
-    logging.info(f"Retrieved {len(hits)} relevant chunks for the query: '{query}'")
+    logging.info(f"Retrieved {len(top_indices)} relevant chunks for the query: '{query}'")
     return relevant_context
 
 def generate_answer_with_llm(context: str, question: str, client: Mistral) -> str:
@@ -224,10 +265,8 @@ async def run_submission(request: Request, submission: SubmissionRequest):
     
     # 3. Embedding Generation
     logging.info("Generating embeddings for document chunks...")
-    # FAISS index is implicitly created and used by the semantic_search utility under the hood.
-    # For very large documents, an explicit FAISS index build would be more scalable.
-    corpus_embeddings = app.state.embedding_model.encode(doc_chunks)
-    logging.info("Embeddings generated and indexed successfully.")
+    corpus_embeddings = generate_embeddings(doc_chunks, app.state.mistral_client)
+    logging.info("Embeddings generated successfully.")
     
     # 4. & 5. Loop through questions to Retrieve and Generate
     final_answers = []
@@ -239,7 +278,7 @@ async def run_submission(request: Request, submission: SubmissionRequest):
             query=question,
             corpus_chunks=doc_chunks,
             corpus_embeddings=corpus_embeddings,
-            model=app.state.embedding_model
+            client=app.state.mistral_client
         )
         
         # Generate the answer using the LLM with the retrieved context
