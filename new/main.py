@@ -2,7 +2,9 @@
 
 import os
 import logging
-from typing import List
+import random
+import time
+from typing import List, Optional
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -31,6 +33,104 @@ EXPECTED_AUTH_TOKEN = "Bearer 02b1ad646a69f58d41c75bb9ea5f78bbaf30389258623d713f
 MISTRAL_EMBEDDING_BATCH_SIZE = 20  # Conservative batch size for Mistral API
 MISTRAL_EMBEDDING_MODEL = "mistral-embed"
 
+# --- API Key Rotation Manager ---
+class MistralAPIKeyManager:
+    """Manages multiple Mistral API keys with intelligent rotation and fallback."""
+    
+    def __init__(self):
+        self.api_keys = []
+        self.clients = {}
+        self.current_key_index = 0
+        self.key_usage_count = {}
+        self.failed_keys = set()
+        self.last_used_time = {}
+        
+        # Load all API keys from environment
+        self._load_api_keys()
+        self._initialize_clients()
+        
+    def _load_api_keys(self):
+        """Load all available API keys from environment variables."""
+        # Try to load keys in order
+        for i in range(1, 11):  # MISTRAL_API_KEY_1 to MISTRAL_API_KEY_10
+            key = os.getenv(f"MISTRAL_API_KEY_{i}")
+            if key and key != "your_api_key_here" and key.strip() != "" and len(key.strip()) > 10:
+                self.api_keys.append(key.strip())
+                self.key_usage_count[key.strip()] = 0
+                self.last_used_time[key.strip()] = 0
+                
+        # Also check the primary key
+        primary_key = os.getenv("MISTRAL_API_KEY")
+        if primary_key and primary_key not in self.api_keys and len(primary_key.strip()) > 10:
+            self.api_keys.append(primary_key)
+            self.key_usage_count[primary_key] = 0
+            self.last_used_time[primary_key] = 0
+            
+        if not self.api_keys:
+            raise ValueError("No valid Mistral API keys found in environment variables.")
+            
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_keys = []
+        for key in self.api_keys:
+            if key not in seen:
+                seen.add(key)
+                unique_keys.append(key)
+        self.api_keys = unique_keys
+            
+        logging.info(f"Loaded {len(self.api_keys)} unique API keys for rotation")
+        
+    def _initialize_clients(self):
+        """Initialize Mistral clients for each API key."""
+        for api_key in self.api_keys:
+            try:
+                self.clients[api_key] = Mistral(api_key=api_key)
+                logging.info(f"Initialized client for API key: ...{api_key[-8:]}")
+            except Exception as e:
+                logging.error(f"Failed to initialize client for API key ...{api_key[-8:]}: {e}")
+                self.failed_keys.add(api_key)
+                
+    def get_next_client(self) -> Mistral:
+        """Get the next available Mistral client with ultra-fast rotation."""
+        available_keys = [key for key in self.api_keys if key not in self.failed_keys]
+        
+        if not available_keys:
+            # Reset failed keys if all have failed (maybe temporary issues)
+            logging.warning("All API keys marked as failed. Resetting and retrying...")
+            self.failed_keys.clear()
+            available_keys = self.api_keys
+            
+        # Ultra-fast round-robin rotation - no complex calculations
+        self.current_key_index = (self.current_key_index + 1) % len(available_keys)
+        best_key = available_keys[self.current_key_index]
+        
+        # Quick update tracking (minimal overhead)
+        current_time = time.time()
+        self.key_usage_count[best_key] += 1
+        self.last_used_time[best_key] = current_time
+        
+        # Only log every 10th call to reduce logging overhead
+        if self.key_usage_count[best_key] % 10 == 1:
+            logging.info(f"Using API key ...{best_key[-8:]} (usage: {self.key_usage_count[best_key]})")
+        
+        return self.clients[best_key]
+            
+    def mark_key_failed(self, client: Mistral):
+        """Mark an API key as failed if it encounters rate limiting or errors."""
+        for api_key, stored_client in self.clients.items():
+            if stored_client == client:
+                self.failed_keys.add(api_key)
+                logging.warning(f"Marked API key ...{api_key[-8:]} as failed")
+                break
+                
+    def get_stats(self) -> dict:
+        """Get usage statistics for all API keys."""
+        return {
+            "total_keys": len(self.api_keys),
+            "failed_keys": len(self.failed_keys),
+            "usage_counts": {f"...{key[-8:]}": count for key, count in self.key_usage_count.items()}
+        }
+
 # --- Initialize Models (Global Singleton Pattern) ---
 # This ensures models are loaded only once on startup, improving latency.
 
@@ -38,13 +138,9 @@ MISTRAL_EMBEDDING_MODEL = "mistral-embed"
 async def lifespan(app: FastAPI):
     """Load models on application startup and cleanup on shutdown."""
     # Startup
-    logging.info("Initializing Mistral LLM Client...")
-    # Initialize the Mistral client with the API key from .env
-    api_key = os.getenv("MISTRAL_API_KEY")
-    if not api_key:
-        raise ValueError("MISTRAL_API_KEY not found in .env file.")
-    app.state.mistral_client = Mistral(api_key=api_key)
-    logging.info("Mistral Client initialized successfully.")
+    logging.info("Initializing Mistral API Key Manager...")
+    app.state.mistral_key_manager = MistralAPIKeyManager()
+    logging.info("Mistral API Key Manager initialized successfully.")
     
     yield
     
@@ -70,14 +166,14 @@ class SubmissionResponse(BaseModel):
 
 # --- Core Service Functions ---
 
-def generate_embeddings(texts: List[str], client: Mistral, batch_size: int = MISTRAL_EMBEDDING_BATCH_SIZE) -> np.ndarray:
+def generate_embeddings(texts: List[str], key_manager: MistralAPIKeyManager, batch_size: int = MISTRAL_EMBEDDING_BATCH_SIZE) -> np.ndarray:
     """
-    Generate embeddings for a list of texts using Mistral's embedding API.
+    Generate embeddings for a list of texts using Mistral's embedding API with key rotation.
     Processes texts in batches to avoid API limits.
     
     Args:
         texts: List of text strings to embed.
-        client: The Mistral API client.
+        key_manager: The Mistral API key manager for rotation.
         batch_size: Maximum number of texts to process in one API call.
         
     Returns:
@@ -96,16 +192,39 @@ def generate_embeddings(texts: List[str], client: Mistral, batch_size: int = MIS
             
             logging.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} texts)")
             
-            embeddings_response = client.embeddings.create(
-                model=MISTRAL_EMBEDDING_MODEL,
-                inputs=batch
-            )
+            # Fast retry with minimal delays
+            max_retries = min(2, len(key_manager.api_keys))  # Reduced retries for speed
+            success = False
             
-            # Extract embeddings from the response
-            batch_embeddings = [item.embedding for item in embeddings_response.data]
-            all_embeddings.extend(batch_embeddings)
-            
-            logging.info(f"Successfully processed batch {batch_num}/{total_batches}")
+            for attempt in range(max_retries):
+                try:
+                    client = key_manager.get_next_client()
+                    embeddings_response = client.embeddings.create(
+                        model=MISTRAL_EMBEDDING_MODEL,
+                        inputs=batch
+                    )
+                    
+                    # Extract embeddings from the response
+                    batch_embeddings = [item.embedding for item in embeddings_response.data]
+                    all_embeddings.extend(batch_embeddings)
+                    
+                    logging.info(f"Successfully processed batch {batch_num}/{total_batches}")
+                    success = True
+                    break
+                    
+                except Exception as e:
+                    error_message = str(e).lower()
+                    if any(term in error_message for term in ["rate_limit", "quota", "exceeded", "throttled"]):
+                        logging.warning(f"Rate limit hit, switching keys (attempt {attempt + 1})")
+                        key_manager.mark_key_failed(client)
+                        # No delay - immediate switch to next key
+                    else:
+                        logging.error(f"Error in batch {batch_num}: {e}")
+                        if attempt == max_retries - 1:
+                            raise
+                        
+            if not success:
+                raise Exception(f"Failed to process batch {batch_num} after {max_retries} attempts")
         
         embeddings_array = np.array(all_embeddings)
         logging.info(f"Successfully generated all embeddings: shape {embeddings_array.shape}")
@@ -160,7 +279,7 @@ def download_and_parse_pdf(pdf_url: str) -> List[str]:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to parse the PDF document.")
 
 
-def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embeddings: np.ndarray, client: Mistral, top_k: int = 5) -> str:
+def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embeddings: np.ndarray, key_manager: MistralAPIKeyManager, top_k: int = 5) -> str:
     """
     Retrieves the most relevant context chunks for a given query using semantic search.
     
@@ -168,14 +287,14 @@ def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embed
         query: The user's question.
         corpus_chunks: The list of text chunks from the document.
         corpus_embeddings: The pre-computed embeddings for the corpus chunks.
-        client: The Mistral API client.
+        key_manager: The Mistral API key manager for rotation.
         top_k: The number of top relevant chunks to retrieve.
 
     Returns:
         A single string containing the concatenated relevant context.
     """
     # Generate embedding for the query using Mistral
-    query_embedding = generate_embeddings([query], client)
+    query_embedding = generate_embeddings([query], key_manager)
     
     # Calculate cosine similarity between query and all corpus chunks
     similarities = cosine_similarity(query_embedding, corpus_embeddings)[0]
@@ -190,7 +309,7 @@ def retrieve_relevant_context(query: str, corpus_chunks: List[str], corpus_embed
     logging.info(f"Retrieved {len(top_indices)} relevant chunks for the query: '{query}'")
     return relevant_context
 
-def generate_answer_with_llm(context: str, question: str, client: Mistral) -> str:
+def generate_answer_with_llm(context: str, question: str, key_manager: MistralAPIKeyManager) -> str:
     """
     Generates an answer using the Mistral LLM based on the provided context and question.
     This function is designed for token efficiency and explainability.
@@ -198,7 +317,7 @@ def generate_answer_with_llm(context: str, question: str, client: Mistral) -> st
     Args:
         context: The relevant text retrieved from the document.
         question: The user's original question.
-        client: The Mistral API client.
+        key_manager: The Mistral API key manager for rotation.
 
     Returns:
         The generated answer string.
@@ -223,18 +342,31 @@ def generate_answer_with_llm(context: str, question: str, client: Mistral) -> st
     3.  If the answer is not found in the context, state explicitly: "The information is not available in the provided document context."
     """
 
-    try:
-        chat_response = client.chat.complete(
-            model="mistral-large-latest", # Using a powerful model for high accuracy
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0, # Low temperature for factual, deterministic answers
-        )
-        answer = chat_response.choices[0].message.content.strip()
-        logging.info("Successfully generated answer with Mistral LLM.")
-        return answer
-    except Exception as e:
-        logging.error(f"Error communicating with Mistral API: {e}")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="The LLM service is currently unavailable.")
+    max_retries = min(2, len(key_manager.api_keys))  # Reduced for speed
+    for attempt in range(max_retries):
+        try:
+            client = key_manager.get_next_client()
+            chat_response = client.chat.complete(
+                model="mistral-large-latest", # Using a powerful model for high accuracy
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0, # Low temperature for factual, deterministic answers
+            )
+            answer = chat_response.choices[0].message.content.strip()
+            logging.info("Successfully generated answer with Mistral LLM.")
+            return answer
+            
+        except Exception as e:
+            error_message = str(e).lower()
+            if any(term in error_message for term in ["rate_limit", "quota", "exceeded", "throttled"]):
+                logging.warning(f"Rate limit hit, switching keys (attempt {attempt + 1})")
+                key_manager.mark_key_failed(client)
+                # No delay - immediate switch
+            else:
+                logging.error(f"Error communicating with Mistral API: {e}")
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="The LLM service is currently unavailable.")
+    
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="All API keys exhausted or unavailable.")
 
 # --- API Endpoint ---
 
@@ -265,7 +397,7 @@ async def run_submission(request: Request, submission: SubmissionRequest):
     
     # 3. Embedding Generation
     logging.info("Generating embeddings for document chunks...")
-    corpus_embeddings = generate_embeddings(doc_chunks, app.state.mistral_client)
+    corpus_embeddings = generate_embeddings(doc_chunks, app.state.mistral_key_manager)
     logging.info("Embeddings generated successfully.")
     
     # 4. & 5. Loop through questions to Retrieve and Generate
@@ -278,19 +410,40 @@ async def run_submission(request: Request, submission: SubmissionRequest):
             query=question,
             corpus_chunks=doc_chunks,
             corpus_embeddings=corpus_embeddings,
-            client=app.state.mistral_client
+            key_manager=app.state.mistral_key_manager
         )
         
         # Generate the answer using the LLM with the retrieved context
         answer = generate_answer_with_llm(
             context=relevant_context,
             question=question,
-            client=app.state.mistral_client
+            key_manager=app.state.mistral_key_manager
         )
         final_answers.append(answer)
         
     # 6. Return Structured JSON Output
     return SubmissionResponse(answers=final_answers)
+
+# --- Additional Monitoring Endpoint ---
+@app.get("/api/stats")
+async def get_api_stats(request: Request):
+    """
+    Get statistics about API key usage and performance.
+    Useful for monitoring during the hackathon.
+    """
+    # Simple authentication check
+    auth_header = request.headers.get("Authorization")
+    if auth_header != EXPECTED_AUTH_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token."
+        )
+    
+    stats = app.state.mistral_key_manager.get_stats()
+    return {
+        "api_key_stats": stats,
+        "status": "API key rotation system active"
+    }
 
 # --- To run the server ---
 if __name__ == "__main__":
