@@ -7,5 +7,13 @@ scikit-learn
 numpy
 mistralai
 python-dotenv
+# Async and caching dependencies
+aiohttp
+aiofiles
+redis
+asyncio
+concurrent.futures
+# LangChain for embeddings
+langchain-nomic
 # Using Mistral's embedding API instead of local models for better scalability
 # and to reduce memory usage and deployment complexity
